@@ -9,6 +9,7 @@ import asyncio
 from mcp.server.fastmcp import FastMCP
 from datetime import datetime
 from pathlib import Path
+import fitz  # PyMuPDF for PDF text extraction
 
 # FastMCPサーバーの初期化
 mcp = FastMCP("paper-collector")
@@ -38,6 +39,7 @@ def initialize_database():
         url TEXT,
         pdf_path TEXT,
         full_text_available INTEGER DEFAULT 0,
+        full_text TEXT,
         published_date TEXT,
         source TEXT,
         keywords TEXT,
@@ -70,6 +72,48 @@ async def download_pdf(url: str, paper_id: str) -> Optional[str]:
         print(f"PDFダウンロードエラー: {e}")
     
     return None
+
+# PDFから全文テキストを抽出
+def extract_text_from_pdf(pdf_path: str) -> Optional[str]:
+    """PDFファイルから全文テキストを抽出する"""
+    if not pdf_path or not os.path.exists(pdf_path):
+        return None
+    
+    try:
+        # PyMuPDFを使用してPDFからテキストを抽出
+        doc = fitz.open(pdf_path)
+        text = ""
+        
+        for page in doc:
+            text += page.get_text()
+        
+        doc.close()
+        return text
+    except Exception as e:
+        print(f"PDFテキスト抽出エラー: {e}")
+        return None
+
+# PDF全文テキストをデータベースに保存
+def save_full_text_to_db(paper_id: str, full_text: str) -> bool:
+    """抽出した全文テキストをデータベースに保存する"""
+    if not full_text:
+        return False
+    
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        
+        c.execute(
+            "UPDATE papers SET full_text = ? WHERE paper_id = ?",
+            (full_text, paper_id)
+        )
+        
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        print(f"全文テキスト保存エラー: {e}")
+        return False
 
 # Semantic Scholar APIを使った検索
 async def search_semantic_scholar(query: str, limit: int = 5) -> List[Dict[str, Any]]:
@@ -378,6 +422,144 @@ async def get_paper_details(paper_id: str) -> str:
     
     conn.close()
     return result
+
+# MCPツール: PDF全文取得
+@mcp.tool()
+async def get_paper_full_text(paper_id: str, max_length: int = 1000000) -> str:
+    """
+    保存されたPDFから論文の全文を取得します。
+    
+    Args:
+        paper_id: 論文のIDまたはタイトル
+        max_length: 返すテキストの最大長さ（デフォルト: 1000000文字）
+    
+    Returns:
+        論文の全文テキスト
+    """
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    
+    # paper_idによる完全一致検索
+    c.execute("SELECT * FROM papers WHERE paper_id = ?", (paper_id,))
+    paper = c.fetchone()
+    
+    # 完全一致がなければタイトルの部分一致で検索
+    if not paper:
+        c.execute("SELECT * FROM papers WHERE title LIKE ?", (f"%{paper_id}%",))
+        paper = c.fetchone()
+    
+    if not paper:
+        conn.close()
+        return f"ID または タイトル '{paper_id}' の論文は見つかりませんでした。"
+    
+    # PDFが存在するか確認
+    if not paper["full_text_available"] or not paper["pdf_path"]:
+        conn.close()
+        return f"論文 '{paper['title']}' のPDFファイルが見つかりませんでした。"
+    
+    # データベースに既に全文が保存されているか確認
+    full_text = paper["full_text"] if paper["full_text"] is not None else None
+    
+    # 全文がデータベースにない場合、PDFから抽出
+    if not full_text:
+        full_text = extract_text_from_pdf(paper["pdf_path"])
+        
+        if full_text:
+            # 抽出したテキストをデータベースに保存
+            save_full_text_to_db(paper["paper_id"], full_text)
+        else:
+            conn.close()
+            return f"論文 '{paper['title']}' のPDFからテキストを抽出できませんでした。"
+    
+    conn.close()
+    
+    # テキストが長すぎる場合は切り詰める
+    if len(full_text) > max_length:
+        full_text = full_text[:max_length] + f"\n\n... (テキストが長いため切り詰められました。全文は {len(full_text)} 文字あります)"
+    
+    return f"タイトル: {paper['title']}\n著者: {paper['authors']}\n\n全文:\n{full_text}"
+
+# MCPツール: 全文検索
+@mcp.tool()
+async def search_full_text(query: str, limit: int = 5) -> str:
+    """
+    論文の全文から特定の文字列を検索します。
+    
+    Args:
+        query: 検索キーワード
+        limit: 表示する最大結果数
+    
+    Returns:
+        検索結果
+    """
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    
+    # データベース内の全文を検索
+    c.execute("""
+    SELECT paper_id, title, authors, pdf_path, full_text
+    FROM papers 
+    WHERE full_text_available = 1
+    ORDER BY collected_date DESC
+    """)
+    
+    papers = c.fetchall()
+    conn.close()
+    
+    if not papers:
+        return "全文が利用可能な論文がありません。"
+    
+    # 検索結果
+    results = []
+    
+    for paper in papers:
+        # 全文がまだ抽出されていない場合、抽出を試みる
+        full_text = paper["full_text"] if paper["full_text"] is not None else None
+        if not full_text and paper["pdf_path"]:
+            full_text = extract_text_from_pdf(paper["pdf_path"])
+            if full_text:
+                save_full_text_to_db(paper["paper_id"], full_text)
+        
+        # 全文内にクエリが含まれているか確認
+        if full_text and query.lower() in full_text.lower():
+            # マッチした部分の前後のコンテキストを取得（最大200文字）
+            index = full_text.lower().find(query.lower())
+            start = max(0, index - 100)
+            end = min(len(full_text), index + len(query) + 100)
+            
+            # コンテキストを取得
+            context = full_text[start:end].replace("\n", " ")
+            if start > 0:
+                context = "..." + context
+            if end < len(full_text):
+                context = context + "..."
+            
+            # 結果に追加
+            results.append({
+                "paper_id": paper["paper_id"],
+                "title": paper["title"],
+                "authors": paper["authors"],
+                "context": context
+            })
+            
+            # 制限に達したら終了
+            if len(results) >= limit:
+                break
+    
+    if not results:
+        return f"キーワード '{query}' を含む論文は見つかりませんでした。"
+    
+    result_text = f"キーワード '{query}' を含む論文: {len(results)}件\n\n"
+    
+    for i, res in enumerate(results, 1):
+        result_text += f"{i}. タイトル: {res['title']}\n"
+        result_text += f"   著者: {res['authors']}\n"
+        result_text += f"   コンテキスト: {res['context']}\n"
+        result_text += f"   (Paper ID: {res['paper_id']})\n\n"
+    
+    return result_text
 
 # MCPツール: 要約のエクスポート
 @mcp.tool()

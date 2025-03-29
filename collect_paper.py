@@ -43,9 +43,28 @@ def initialize_database():
         published_date TEXT,
         source TEXT,
         keywords TEXT,
-        collected_date TEXT
+        collected_date TEXT,
+        citation_count INTEGER DEFAULT 0,
+        venue TEXT,
+        venue_impact_score REAL DEFAULT 0.0
     )
     ''')
+    
+    # 既存のテーブルに新しいカラムを追加
+    try:
+        c.execute("ALTER TABLE papers ADD COLUMN citation_count INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+        
+    try:
+        c.execute("ALTER TABLE papers ADD COLUMN venue TEXT")
+    except sqlite3.OperationalError:
+        pass
+        
+    try:
+        c.execute("ALTER TABLE papers ADD COLUMN venue_impact_score REAL DEFAULT 0.0")
+    except sqlite3.OperationalError:
+        pass
     
     conn.commit()
     conn.close()
@@ -115,29 +134,61 @@ def save_full_text_to_db(paper_id: str, full_text: str) -> bool:
         print(f"全文テキスト保存エラー: {e}")
         return False
 
-# Semantic Scholar APIを使った検索
-async def search_semantic_scholar(query: str, limit: int = 5) -> List[Dict[str, Any]]:
-    """Semantic Scholar APIを使って論文を検索"""
-    url = "https://api.semanticscholar.org/graph/v1/paper/search"
+# arXiv論文の引用情報を取得
+async def get_arxiv_citation_data(arxiv_id: str) -> Dict[str, Any]:
+    """arXiv IDを使ってSemantic Scholar APIから引用情報を取得"""
+    url = f"https://api.semanticscholar.org/graph/v1/paper/arXiv:{arxiv_id}"
     params = {
-        "query": query,
-        "limit": limit,
-        "fields": "title,authors,abstract,url,year,venue,openAccessPdf"
+        "fields": "citationCount,venue,influentialCitationCount"
     }
     
     async with httpx.AsyncClient() as client:
         response = await client.get(url, params=params)
         if response.status_code != 200:
+            return {"citation_count": 0, "venue": "", "venue_impact_score": 0.0}
+        
+        data = response.json()
+        return {
+            "citation_count": data.get("citationCount", 0) or 0,
+            "venue": data.get("venue", ""),
+            "venue_impact_score": 0.0
+        }
+
+# Semantic Scholar APIを使った検索
+async def search_semantic_scholar(query: str, limit: int = 5, min_citations: int = 0, sort_by: str = "relevance") -> List[Dict[str, Any]]:
+    """Semantic Scholar APIを使って論文を検索"""
+    url = "https://api.semanticscholar.org/graph/v1/paper/search"
+    fields = "title,authors,abstract,url,year,venue,openAccessPdf,citationCount,venue,influentialCitationCount"
+    
+    params = {
+        "query": query,
+        "limit": limit * 2,
+        "fields": fields
+    }
+    
+    headers = {
+        "Accept": "application/json"
+    }
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.get(url, params=params, headers=headers)
+        if response.status_code != 200:
             return []
         
         data = response.json()
-        results = []
+        all_results = []
         
         for paper in data.get("data", []):
             if not paper.get("abstract"):
                 continue
                 
+            citation_count = paper.get("citationCount", 0) or 0
+            
+            if citation_count < min_citations:
+                continue
+                
             authors = [author.get("name", "") for author in paper.get("authors", [])]
+            venue = paper.get("venue", "")
             
             # PDFのURLを取得（openAccessPdfフィールドから）
             pdf_url = None
@@ -150,10 +201,13 @@ async def search_semantic_scholar(query: str, limit: int = 5) -> List[Dict[str, 
                 "authors": ", ".join(authors),
                 "abstract": paper.get("abstract", ""),
                 "url": paper.get("url", ""),
-                "pdf_url": pdf_url,  # PDFのURL
+                "pdf_url": pdf_url,
                 "published_date": paper.get("year", ""),
                 "source": "Semantic Scholar",
-                "keywords": query
+                "keywords": query,
+                "citation_count": citation_count,
+                "venue": venue,
+                "venue_impact_score": 0.0
             }
             
             # PDFが利用可能な場合はダウンロード
@@ -164,28 +218,38 @@ async def search_semantic_scholar(query: str, limit: int = 5) -> List[Dict[str, 
             paper_data["pdf_path"] = pdf_path
             paper_data["full_text_available"] = 1 if pdf_path else 0
             
-            results.append(paper_data)
+            all_results.append(paper_data)
             
-        return results
+        if sort_by == "citations":
+            all_results.sort(key=lambda x: x["citation_count"], reverse=True)
+        
+        return all_results[:limit]
 
 # arXiv APIを使った検索
-async def search_arxiv(query: str, limit: int = 5) -> List[Dict[str, Any]]:
+async def search_arxiv(query: str, limit: int = 5, min_citations: int = 0, sort_by: str = "relevance") -> List[Dict[str, Any]]:
     """arXiv APIを使って論文を検索"""
     client = arxiv.Client(
-        page_size=limit,
+        page_size=limit * 2,
         delay_seconds=3.0,
         num_retries=3
     )
     
+    search_criteria = arxiv.SortCriterion.Relevance
+    if sort_by == "recency":
+        search_criteria = arxiv.SortCriterion.SubmittedDate
+    
     search = arxiv.Search(
         query=query,
-        max_results=limit,
-        sort_by=arxiv.SortCriterion.Relevance
+        max_results=limit * 2,
+        sort_by=search_criteria
     )
     
     results = []
+    paper_tasks = []
+    
     for paper in client.results(search):
         paper_id = paper.entry_id.split("/")[-1]
+        arxiv_id = paper_id
         
         paper_data = {
             "paper_id": paper_id,
@@ -193,21 +257,44 @@ async def search_arxiv(query: str, limit: int = 5) -> List[Dict[str, Any]]:
             "authors": ", ".join([author.name for author in paper.authors]),
             "abstract": paper.summary,
             "url": paper.entry_id,
-            "pdf_url": paper.pdf_url,  # PDFのURL
+            "pdf_url": paper.pdf_url,
             "published_date": paper.published.year if hasattr(paper.published, "year") else "",
             "source": "arXiv",
-            "keywords": query
+            "keywords": query,
+            "arxiv_id": arxiv_id
         }
         
+        # タスクリストに追加（非同期で引用データを取得するため）
+        paper_tasks.append((paper_data, get_arxiv_citation_data(arxiv_id)))
+    
+    # 引用データを非同期で取得
+    for paper_data, citation_task in paper_tasks:
+        citation_info = await citation_task
+        
+        # 引用数の取得と最小引用数でのフィルタリング
+        citation_count = citation_info.get("citation_count", 0)
+        if citation_count < min_citations:
+            continue
+        
+        # 引用情報の追加
+        paper_data["citation_count"] = citation_count
+        paper_data["venue"] = citation_info.get("venue", "")
+        paper_data["venue_impact_score"] = citation_info.get("venue_impact_score", 0.0)
+        
         # PDFをダウンロード
-        pdf_path = await download_pdf(paper.pdf_url, paper_id)
+        pdf_path = await download_pdf(paper_data["pdf_url"], paper_data["paper_id"])
         
         paper_data["pdf_path"] = pdf_path
         paper_data["full_text_available"] = 1 if pdf_path else 0
         
         results.append(paper_data)
-        
-    return results
+    
+    # ソート
+    if sort_by == "citations":
+        results.sort(key=lambda x: x["citation_count"], reverse=True)
+    
+    # 指定された最大件数に絞る
+    return results[:limit]
 
 # データベースへの保存
 def save_to_database(papers: List[Dict[str, Any]]) -> int:
@@ -224,15 +311,18 @@ def save_to_database(papers: List[Dict[str, Any]]) -> int:
     for paper in papers:
         # 既存の論文をチェック
         c.execute("SELECT paper_id FROM papers WHERE paper_id = ?", (paper["paper_id"],))
-        if c.fetchone() is None:
+        existing_paper = c.fetchone()
+        
+        if existing_paper is None:
             # 新しい論文の場合、挿入
             paper["collected_date"] = datetime.now().strftime("%Y-%m-%d")
             
             c.execute('''
             INSERT INTO papers (
                 paper_id, title, authors, abstract, url, pdf_path, 
-                full_text_available, published_date, source, keywords, collected_date
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                full_text_available, published_date, source, keywords, collected_date,
+                citation_count, venue, venue_impact_score
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 paper["paper_id"], 
                 paper["title"], 
@@ -244,10 +334,25 @@ def save_to_database(papers: List[Dict[str, Any]]) -> int:
                 paper["published_date"], 
                 paper["source"], 
                 paper["keywords"], 
-                paper["collected_date"]
+                paper["collected_date"],
+                paper.get("citation_count", 0),
+                paper.get("venue", ""),
+                paper.get("venue_impact_score", 0.0)
             ))
             
             new_papers_count += 1
+        else:
+            # 既存の論文の場合、引用数と掲載先情報を更新
+            c.execute('''
+            UPDATE papers 
+            SET citation_count = ?, venue = ?, venue_impact_score = ?
+            WHERE paper_id = ?
+            ''', (
+                paper.get("citation_count", 0),
+                paper.get("venue", ""),
+                paper.get("venue_impact_score", 0.0),
+                paper["paper_id"]
+            ))
     
     conn.commit()
     conn.close()
@@ -311,6 +416,63 @@ async def search_papers(query: str, source: str = "both", limit: int = 5) -> str
     
     return summary
 
+# MCPツール: 引用数による論文検索
+@mcp.tool()
+async def search_papers_by_citations(
+    query: str, 
+    min_citations: int = 10, 
+    source: str = "both", 
+    limit: int = 5, 
+    sort_by: str = "citations"
+) -> str:
+    """
+    引用数を考慮した論文検索を行い、結果をデータベースに保存します。
+    
+    Args:
+        query: 検索キーワード
+        min_citations: 最小引用数
+        source: 論文ソース ("arxiv", "semantic_scholar", または "both")
+        limit: 各ソースから取得する論文の最大数
+        sort_by: ソート方法 ("relevance", "citations", "recency")
+    
+    Returns:
+        検索結果の要約
+    """
+    papers = []
+    
+    if source.lower() in ["arxiv", "both"]:
+        arxiv_papers = await search_arxiv(query, limit, min_citations, sort_by)
+        papers.extend(arxiv_papers)
+        
+    if source.lower() in ["semantic_scholar", "both"]:
+        semantic_papers = await search_semantic_scholar(query, limit, min_citations, sort_by)
+        papers.extend(semantic_papers)
+    
+    if sort_by == "citations":
+        papers.sort(key=lambda x: x.get("citation_count", 0), reverse=True)
+        papers = papers[:limit]
+    
+    saved_count = save_to_database(papers)
+    
+    summary = f"検索キーワード「{query}」で最小引用数 {min_citations} 以上の論文が {len(papers)}件見つかりました。\n"
+    summary += f"そのうち{saved_count}件が新規としてデータベースに保存されました。\n\n"
+    
+    if papers:
+        summary += "検索結果:\n"
+        for i, paper in enumerate(papers, 1):
+            full_text = "（全文あり）" if paper.get("full_text_available", 0) == 1 else ""
+            summary += f"{i}. {paper['title']} ({paper['source']})\n"
+            summary += f"   著者: {paper['authors']}\n"
+            summary += f"   引用数: {paper.get('citation_count', 0)}\n"
+            if paper.get("venue"):
+                summary += f"   掲載先: {paper.get('venue')}\n"
+            summary += f"   URL: {paper['url']}\n"
+            summary += f"   {full_text}\n\n"
+    else:
+        summary += "指定された条件に合致する論文は見つかりませんでした。"
+    
+    return summary
+
 # MCPツール: 保存された論文の一覧
 @mcp.tool()
 async def list_saved_papers(keyword: str = "", source: str = "", limit: int = 10) -> str:
@@ -367,11 +529,172 @@ async def list_saved_papers(keyword: str = "", source: str = "", limit: int = 10
         result += f"著者: {paper['authors']}\n"
         result += f"ソース: {paper['source']}\n"
         result += f"URL: {paper['url']}\n"
+        if paper["citation_count"] > 0:
+            result += f"引用数: {paper['citation_count']}\n"
+        if paper["venue"]:
+            result += f"掲載先: {paper['venue']}\n"
         result += f"概要: {paper['abstract'][:200]}...\n"
         result += f"収集日: {paper['collected_date']}\n"
         result += "-" * 50 + "\n"
     
     conn.close()
+    return result
+
+# MCPツール: 引用数でランキング
+@mcp.tool()
+async def rank_papers_by_citations(keyword: str = "", limit: int = 10) -> str:
+    """
+    保存された論文を引用数でランキングして表示します。
+    
+    Args:
+        keyword: 特定のキーワードでフィルタリング（オプション）
+        limit: 表示する論文の最大数
+    
+    Returns:
+        引用数ランキング
+    """
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    
+    query = "SELECT * FROM papers"
+    params = []
+    
+    if keyword:
+        query += " WHERE (title LIKE ? OR abstract LIKE ? OR keywords LIKE ?)"
+        keyword_param = f"%{keyword}%"
+        params.extend([keyword_param, keyword_param, keyword_param])
+    
+    query += " ORDER BY citation_count DESC LIMIT ?"
+    params.append(limit)
+    
+    c.execute(query, params)
+    papers = c.fetchall()
+    
+    if not papers:
+        conn.close()
+        return "指定された条件に合致する論文は見つかりませんでした。"
+    
+    result = f"引用数ランキング（{keyword if keyword else '全て'}）:\n\n"
+    
+    for i, paper in enumerate(papers, 1):
+        result += f"{i}. {paper['title']}\n"
+        result += f"   著者: {paper['authors']}\n"
+        result += f"   引用数: {paper['citation_count']}\n"
+        if paper['venue']:
+            result += f"   掲載先: {paper['venue']}\n"
+        result += f"   ソース: {paper['source']}\n"
+        result += f"   URL: {paper['url']}\n"
+        result += f"   収集日: {paper['collected_date']}\n"
+        result += "-" * 50 + "\n"
+    
+    conn.close()
+    return result
+
+# MCPツール: 掲載先（ジャーナルや会議）ごとの論文一覧
+@mcp.tool()
+async def list_papers_by_venue(venue: str = "", limit: int = 10) -> str:
+    """
+    特定の掲載先（ジャーナルや会議）の論文一覧を表示します。
+    
+    Args:
+        venue: 掲載先の名前（部分一致）
+        limit: 表示する論文の最大数
+    
+    Returns:
+        論文一覧
+    """
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    
+    query = "SELECT * FROM papers"
+    params = []
+    
+    if venue:
+        query += " WHERE venue LIKE ?"
+        params.append(f"%{venue}%")
+    else:
+        query += " WHERE venue IS NOT NULL AND venue != ''"
+    
+    query += " ORDER BY citation_count DESC LIMIT ?"
+    params.append(limit)
+    
+    c.execute(query, params)
+    papers = c.fetchall()
+    
+    if not papers:
+        conn.close()
+        return "指定された掲載先の論文は見つかりませんでした。"
+    
+    venues = {}
+    for paper in papers:
+        v = paper['venue']
+        if v not in venues:
+            venues[v] = []
+        venues[v].append(paper)
+    
+    result = f"掲載先別論文一覧（{venue if venue else '全て'}）:\n\n"
+    
+    for v, v_papers in venues.items():
+        result += f"【{v}】- {len(v_papers)}件\n"
+        for paper in v_papers:
+            result += f"- {paper['title']}\n"
+            result += f"  著者: {paper['authors']}\n"
+            result += f"  引用数: {paper['citation_count']}\n"
+            result += f"  URL: {paper['url']}\n"
+        result += "-" * 50 + "\n"
+    
+    conn.close()
+    return result
+
+# MCPツール: トップの掲載先一覧
+@mcp.tool()
+async def list_top_venues(limit: int = 10) -> str:
+    """
+    データベースに保存されている論文のトップ掲載先一覧を表示します。
+    
+    Args:
+        limit: 表示する掲載先の最大数
+    
+    Returns:
+        掲載先一覧
+    """
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    c.execute('''
+    SELECT 
+        venue, 
+        COUNT(*) as paper_count, 
+        AVG(citation_count) as avg_citations,
+        MAX(citation_count) as max_citations
+    FROM 
+        papers 
+    WHERE 
+        venue IS NOT NULL AND venue != ''
+    GROUP BY 
+        venue 
+    ORDER BY 
+        avg_citations DESC
+    LIMIT ?
+    ''', (limit,))
+    
+    venues = c.fetchall()
+    conn.close()
+    
+    if not venues:
+        return "掲載先情報がある論文がありません。"
+    
+    result = "トップ掲載先一覧（平均引用数順）:\n\n"
+    
+    for i, (venue, paper_count, avg_citations, max_citations) in enumerate(venues, 1):
+        result += f"{i}. {venue}\n"
+        result += f"   論文数: {paper_count}件\n"
+        result += f"   平均引用数: {avg_citations:.1f}\n"
+        result += f"   最大引用数: {max_citations}\n"
+        result += "-" * 50 + "\n"
+    
     return result
 
 # MCPツール: 論文の詳細表示
@@ -409,6 +732,12 @@ async def get_paper_details(paper_id: str) -> str:
     result += f"出版年: {paper['published_date']}\n"
     result += f"ソース: {paper['source']}\n"
     result += f"URL: {paper['url']}\n"
+    
+    if paper["citation_count"] > 0:
+        result += f"引用数: {paper['citation_count']}\n"
+    
+    if paper["venue"]:
+        result += f"掲載先: {paper['venue']}\n"
     
     if paper["full_text_available"] and paper["pdf_path"]:
         result += f"PDF: {paper['pdf_path']}\n"
@@ -579,7 +908,8 @@ async def export_summaries(format: str = "json") -> str:
     
     c.execute('''
     SELECT paper_id, title, authors, abstract, url, source, 
-           full_text_available, pdf_path, collected_date 
+           full_text_available, pdf_path, collected_date,
+           citation_count, venue
     FROM papers
     ''')
     

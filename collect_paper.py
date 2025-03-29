@@ -485,7 +485,7 @@ async def search_papers(query: str, source: str = "both", limit: int = 5) -> str
 @mcp.tool()
 async def search_papers_by_citations(
     query: str, 
-    min_citations: int = 10, 
+    min_citations: int = 0, 
     source: str = "both", 
     limit: int = 5, 
     sort_by: str = "citations"

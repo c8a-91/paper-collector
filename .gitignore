@@ -8,3 +8,49 @@ wheels/
 
 # Virtual environments
 .venv
+venv/
+env/
+ENV/
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Database files
+*.db
+*.sqlite3
+*.db-journal
+
+# Logs
+*.log
+logs/
+
+# Test related
+.coverage
+htmlcov/
+.pytest_cache/
+.tox/
+.nox/
+
+# Documentation
+docs/_build/
+site/
+
+# Data files - exclude only the data directory
+data/
+# Keep the config directory
+# config/
+
+# Environment variables and secrets
+.env
+.secrets
+
+# OS specific files
+.DS_Store
+Thumbs.db
+
+# Lock files - typically don't ignore these for reproducible builds
+# !uv.lock  # Uncomment this line to explicitly include uv.lock if needed

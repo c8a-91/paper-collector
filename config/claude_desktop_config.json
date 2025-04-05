@@ -1,0 +1,44 @@
+{
+    "name": "Paper Collector",
+    "version": "0.1.0",
+    "description": "論文の検索・収集・管理を行うシンプルなツール",
+    
+    "_注意": "=== 以下のmcpServersセクションの設定が必要です ===",
+    "mcpServers": {
+        "paper-collector": {
+            "command": "uv",
+            "args": [
+                "--directory",
+                "【ここを変更】リポジトリのパスを絶対パスで指定してください（例：C:\\Users\\username\\path\\to\\paper-collector）",
+                "run",
+                "paper-collector"
+            ],
+            "description": "論文の検索・収集・管理を行うシンプルなツール",
+            "helpText": "Paper Collectorは、arXivとSemantic Scholarから論文を検索し、PDFと共にデータを管理するためのツールです。\n\n使用例:\n- 「論文を検索して: 量子コンピューティング」\n- 「引用数100以上の機械学習論文を検索して」\n- 「2023年から2024年までの自然言語処理の論文を検索して」\n- 「保存した論文の一覧を表示して」\n- 「論文タイトルの詳細を表示して」"
+        }
+    },
+    "_補足": "=== 設定手順 ===\n1. 【ここを変更】の部分をリポジトリの絶対パスに置き換えてください\n2. Windowsの場合は \\ を \\\\ にする必要があります\n3. 設定後はClaude for Desktopの拡張機能タブからインポートできます",
+    
+    "instructions": {
+        "setup": [
+            "paper-collectorをインストールしてください: uv pip install -e .",
+            "ターミナルでpaper-collectorを起動してください: paper-collector"
+        ],
+        "usage": [
+            "論文を検索して: <検索キーワード>",
+            "引用数で検索: 引用数100以上の<キーワード>論文を検索",
+            "日付範囲で検索: <開始年>年から<終了年>年までの<キーワード>論文を検索",
+            "保存した論文の一覧を表示",
+            "<論文タイトル>の詳細を表示",
+            "<論文タイトル>の全文を表示",
+            "保存された論文から<キーワード>について検索"
+        ]
+    },
+    "capabilities": [
+        "arXivとSemantic Scholarからの論文検索",
+        "論文メタデータとPDFの自動保存",
+        "キーワード、引用数、日付範囲での検索",
+        "PDFからの全文テキスト抽出と検索",
+        "論文データのCSV/JSON形式でのエクスポート"
+    ]
+}

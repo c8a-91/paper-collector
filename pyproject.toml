@@ -1,9 +1,26 @@
+[build-system]
+requires = ["setuptools>=61.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
-name = "paper"
+name = "paper-collector"
 version = "0.1.0"
-description = "Add your description here"
+description = "学術論文検索・管理ツール"
 readme = "README.md"
 requires-python = ">=3.12"
+license = {text = "MIT"}
+authors = [
+    {name = "c8a"}
+]
+keywords = ["research", "papers", "arxiv", "semantic-scholar", "claude", "mcp"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Scientific/Engineering",
+]
 dependencies = [
     "arxiv>=2.1.3",
     "beautifulsoup4>=4.13.3",
@@ -12,3 +29,46 @@ dependencies = [
     "pandas>=2.2.3",
     "pymupdf>=1.23.0",
 ]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "black>=23.0.0",
+    "isort>=5.12.0",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/user/paper-collector"
+"Bug Tracker" = "https://github.com/user/paper-collector/issues"
+
+# コマンドラインスクリプト定義
+[project.scripts]
+paper-collector = "paper_collector.cli:main"
+
+# モジュール実行時のエントリーポイント
+[project.entry-points."console_scripts"]
+paper-collector = "paper_collector.cli:main"
+
+# uvでの実行をサポート
+[project.gui-scripts]
+paper-collector-gui = "paper_collector.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = ["paper_collector", "paper_collector.db", "paper_collector.api", "paper_collector.pdf", "paper_collector.tools", "paper_collector.utils"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+paper_collector = ["*.json", "*.txt"]
+
+[tool.black]
+line-length = 88
+target-version = ["py312"]
+
+[tool.isort]
+profile = "black"
+line_length = 88
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
